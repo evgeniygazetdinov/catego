@@ -16,6 +16,7 @@ if [ -z "${ANDROID_HOME:-}" ]; then
     fi
 fi
 
+
 # Системный adb из /usr/bin (пакет Ubuntu → /usr/lib/android-sdk) часто раньше в PATH.
 # Flutter ищет SDK через `which adb` — без этого берётся «пустой» /usr/lib, хотя ANDROID_HOME верный.
 if [ -n "${ANDROID_HOME:-}" ]; then
