@@ -1,0 +1,117 @@
+plugins {
+    id "com.android.application"
+    id "kotlin-android"
+    // The Flutter Gradle Plugin must be applied after the Android and Kotlin Gradle plugins.
+    id "dev.flutter.flutter-gradle-plugin"
+}
+
+// --- Автоинкремент versionCode и копия релиза в dist/ (только assembleRelease / bundleRelease) ---
+def repoRoot = rootProject.projectDir.parentFile
+def releaseCounterFile = new File(repoRoot, "release_build_number.txt")
+def taskNamesLower = gradle.startParameter.taskNames.join(" ").toLowerCase()
+def isReleaseArtifactBuild = taskNamesLower.contains("assemblerelease") ||
+        taskNamesLower.contains("bundlerelease")
+
+def parsePubspecVersionName(File root) {
+    def pub = new File(root, "pubspec.yaml")
+    if (!pub.exists()) return "1.0.0"
+    def line = pub.readLines().find { it.trim().startsWith("version:") }
+    if (line == null) return "1.0.0"
+    def m = (line =~ /version:\s*([\d.]+)/)
+    return m.find() ? m.group(1) : "1.0.0"
+}
+
+def pubVersionName = parsePubspecVersionName(repoRoot)
+def releaseBuildNumber = releaseCounterFile.exists()
+        ? releaseCounterFile.text.trim().toInteger()
+        : 0
+
+if (isReleaseArtifactBuild) {
+    releaseBuildNumber = releaseBuildNumber + 1
+    releaseCounterFile.text = "${releaseBuildNumber}\n"
+}
+
+android {
+    namespace = "com.example.risuem_s"
+    compileSdk = flutter.compileSdkVersion
+    ndkVersion = flutter.ndkVersion
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_1_8
+        targetCompatibility = JavaVersion.VERSION_1_8
+    }
+
+    kotlinOptions {
+        jvmTarget = JavaVersion.VERSION_1_8
+    }
+
+    defaultConfig {
+        // TODO: Specify your own unique Application ID (https://developer.android.com/studio/publish/application-id.html).
+        applicationId = "com.example.risuem_s"
+        // You can update the following values to match your application needs.
+        // For more information, see: https://flutter.dev/to/review-gradle-config.
+        minSdkVersion = flutter.minSdkVersion
+        targetSdk = flutter.targetSdkVersion
+        if (isReleaseArtifactBuild) {
+            versionCode = releaseBuildNumber
+            versionName = "${pubVersionName}+${releaseBuildNumber}"
+        } else {
+            versionCode = flutter.versionCode
+            versionName = flutter.versionName
+        }
+    }
+
+    buildTypes {
+        release {
+            // TODO: Add your own signing config for the release build.
+            // Signing with the debug keys for now, so `flutter run --release` works.
+            signingConfig = signingConfigs.debug
+        }
+    }
+}
+
+flutter {
+    source = "../.."
+}
+
+// Копия APK/AAB в dist/ после сборки (finalizedBy — иначе APK ещё не на месте)
+tasks.register("copyReleaseApkToDist") {
+    group = "release"
+    doLast {
+        def distDir = new File(repoRoot, "dist")
+        def n = releaseCounterFile.exists() ? releaseCounterFile.text.trim().toInteger() : 0
+        def ver = parsePubspecVersionName(repoRoot)
+        def apkFlutter = new File(repoRoot, "build/app/outputs/flutter-apk/app-release.apk")
+        def apkStd = new File(repoRoot, "build/app/outputs/apk/release/app-release.apk")
+        def src = apkFlutter.exists() ? apkFlutter : apkStd
+        if (src.exists()) {
+            distDir.mkdirs()
+            def out = new File(distDir, "risuem_s-${ver}+${n}.apk")
+            out.bytes = src.bytes
+            println "Release APK copy: ${out.absolutePath}"
+        } else {
+            println "copyReleaseApkToDist: APK not found (flutter-apk / apk/release)."
+        }
+    }
+}
+
+tasks.register("copyReleaseBundleToDist") {
+    group = "release"
+    doLast {
+        def distDir = new File(repoRoot, "dist")
+        def n = releaseCounterFile.exists() ? releaseCounterFile.text.trim().toInteger() : 0
+        def ver = parsePubspecVersionName(repoRoot)
+        def aab = new File(repoRoot, "build/app/outputs/bundle/release/app-release.aab")
+        if (aab.exists()) {
+            distDir.mkdirs()
+            def out = new File(distDir, "risuem_s-${ver}+${n}.aab")
+            out.bytes = aab.bytes
+            println "Release AAB copy: ${out.absolutePath}"
+        }
+    }
+}
+
+afterEvaluate {
+    tasks.findByName("assembleRelease")?.finalizedBy(tasks.named("copyReleaseApkToDist"))
+    tasks.findByName("bundleRelease")?.finalizedBy(tasks.named("copyReleaseBundleToDist"))
+}
