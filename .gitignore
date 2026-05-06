@@ -53,3 +53,4 @@ windows/
 linux/
 macos/
 .continue/
+release_build_number.txt
