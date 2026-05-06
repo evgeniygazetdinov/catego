@@ -98,55 +98,59 @@ void _paintStrokeOnCanvas(Canvas canvas, Stroke stroke) {
   canvas.drawPath(path, paint);
 }
 
-class DrawingPainter extends CustomPainter {
-  DrawingPainter(
+/// Только запечённый растр — перерисовывается лишь когда bake обновил текстуру (не каждый кадр пальца).
+class CommittedLayerPainter extends CustomPainter {
+  CommittedLayerPainter(this.image, {required this.layerTick});
+
+  final ui.Image? image;
+  final int layerTick;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (image == null) return;
+    final src = Rect.fromLTWH(
+      0,
+      0,
+      image!.width.toDouble(),
+      image!.height.toDouble(),
+    );
+    canvas.drawImageRect(
+      image!,
+      src,
+      Offset.zero & size,
+      Paint()..filterQuality = FilterQuality.low,
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant CommittedLayerPainter oldDelegate) =>
+      oldDelegate.layerTick != layerTick || oldDelegate.image != image;
+}
+
+/// Штрихи ещё не в растре — обновляется при жесте; не трогает тяжёлый committed-слой.
+class ActiveStrokesPainter extends CustomPainter {
+  ActiveStrokesPainter(
     this.strokes, {
     required this.repaintTick,
-    this.drawBackground = false,
-    this.committedImage,
-    this.committedStrokeCount = 0,
+    required this.committedStrokeCount,
   });
 
   final List<Stroke> strokes;
   final int repaintTick;
-  final bool drawBackground;
-  /// Растер завершённых штрихов — один drawImage вместо тысяч примитивов.
-  final ui.Image? committedImage;
   final int committedStrokeCount;
 
   @override
   void paint(Canvas canvas, Size size) {
-    if (drawBackground) {
-      final bg = Paint()..color = Colors.white;
-      canvas.drawRect(Offset.zero & size, bg);
-    }
-
-    if (committedImage != null) {
-      final src = Rect.fromLTWH(
-        0,
-        0,
-        committedImage!.width.toDouble(),
-        committedImage!.height.toDouble(),
-      );
-      canvas.drawImageRect(
-        committedImage!,
-        src,
-        Offset.zero & size,
-        Paint()..filterQuality = FilterQuality.low,
-      );
-    }
-
     for (var i = committedStrokeCount; i < strokes.length; i++) {
       _paintStrokeOnCanvas(canvas, strokes[i]);
     }
   }
 
   @override
-  bool shouldRepaint(covariant DrawingPainter oldDelegate) =>
+  bool shouldRepaint(covariant ActiveStrokesPainter oldDelegate) =>
       oldDelegate.repaintTick != repaintTick ||
-      oldDelegate.drawBackground != drawBackground ||
-      oldDelegate.committedImage != committedImage ||
-      oldDelegate.committedStrokeCount != committedStrokeCount;
+      oldDelegate.committedStrokeCount != committedStrokeCount ||
+      oldDelegate.strokes.length != strokes.length;
 }
 
 /// Холст: жесты и штрихи изолированы от родителя — меньше лишних перерисовок.
@@ -186,9 +190,10 @@ class PaintingViewportState extends State<PaintingViewport> {
   final math.Random _rand = math.Random();
   final List<Stroke> _strokes = <Stroke>[];
   Stroke? _current;
-  int _repaintTick = 0;
-  /// Перерисовка только слоя штрихов — без разборки всего Stack (фон PNG дорогой).
+  /// Жест: активный слой штрихов (частые события).
   final ValueNotifier<int> _strokeLayerTick = ValueNotifier<int>(0);
+  /// Запечённая текстура — только когда bake завершился (редко).
+  final ValueNotifier<int> _committedLayerTick = ValueNotifier<int>(0);
   DateTime? _lastSprayTime;
   Offset? _lastSprayPos;
 
@@ -204,6 +209,7 @@ class PaintingViewportState extends State<PaintingViewport> {
   void dispose() {
     _committedImage?.dispose();
     _strokeLayerTick.dispose();
+    _committedLayerTick.dispose();
     super.dispose();
   }
 
@@ -253,12 +259,13 @@ class PaintingViewportState extends State<PaintingViewport> {
     var end = exclusiveEnd.clamp(0, _strokes.length);
     if (start >= end) return;
 
-    final w = (size.width * dpr).round().clamp(1, 8192);
-    final h = (size.height * dpr).round().clamp(1, 8192);
+    final bakeDpr = math.min(dpr, 2.5);
+    final w = (size.width * bakeDpr).round().clamp(1, 8192);
+    final h = (size.height * bakeDpr).round().clamp(1, 8192);
 
     final recorder = ui.PictureRecorder();
     final canvas = Canvas(recorder);
-    canvas.scale(dpr);
+    canvas.scale(bakeDpr);
 
     if (_committedImage != null) {
       final src = Rect.fromLTWH(
@@ -280,12 +287,14 @@ class PaintingViewportState extends State<PaintingViewport> {
     }
 
     final picture = recorder.endRecording();
-    late final ui.Image newImage;
+    ui.Image newImage;
     try {
       newImage = await picture.toImage(w, h);
-    } finally {
+    } catch (_) {
       picture.dispose();
+      return;
     }
+    picture.dispose();
 
     if (!mounted) {
       newImage.dispose();
@@ -305,7 +314,7 @@ class PaintingViewportState extends State<PaintingViewport> {
     _committedImage = newImage;
     _committedStrokeCount = end;
     prev?.dispose();
-    _repaintTick++;
+    _committedLayerTick.value++;
     _strokeLayerTick.value++;
   }
 
@@ -316,7 +325,7 @@ class PaintingViewportState extends State<PaintingViewport> {
     _strokes.clear();
     _current = null;
     _resetCommittedLayer();
-    _repaintTick++;
+    _committedLayerTick.value++;
     _strokeLayerTick.value++;
     setState(() {});
     widget.onHasStrokesChanged(false);
@@ -341,7 +350,6 @@ class PaintingViewportState extends State<PaintingViewport> {
     SchedulerBinding.instance.scheduleFrameCallback((_) {
       _strokeRepaintPending = false;
       if (gen != _paintGen) return;
-      _repaintTick++;
       _strokeLayerTick.value++;
       widget.onHasStrokesChanged(_strokes.isNotEmpty);
     });
@@ -377,7 +385,12 @@ class PaintingViewportState extends State<PaintingViewport> {
   }
 
   /// На больших экранах PointerMove сыплет сотнями событий — ограничиваем баллончик.
-  bool _shouldSprayOnMove(Offset pos, double spread, {required bool hasBackground}) {
+  bool _shouldSprayOnMove(
+    Offset pos,
+    double spread, {
+    required bool hasBackground,
+    int sprayParticleCount = 0,
+  }) {
     final lastT = _lastSprayTime;
     final lastP = _lastSprayPos;
     if (lastT == null || lastP == null) return true;
@@ -388,6 +401,14 @@ class PaintingViewportState extends State<PaintingViewport> {
     if (hasBackground) {
       minGap += 0.55;
       minMs = 19;
+    }
+    if (sprayParticleCount > 4000) {
+      minGap *= 1.85;
+      minMs = math.max(minMs, 26);
+    }
+    if (sprayParticleCount > 8000) {
+      minGap *= 1.4;
+      minMs = math.max(minMs, 33);
     }
     if (dtMs < minMs && dist < minGap) return false;
     return true;
@@ -411,7 +432,7 @@ class PaintingViewportState extends State<PaintingViewport> {
         if (_canvasSize != Size.zero && _layoutSizeChanged(_canvasSize, size)) {
           _paintGen++;
           _resetCommittedLayer();
-          _repaintTick++;
+          _committedLayerTick.value++;
           _strokeLayerTick.value++;
         }
         _canvasSize = size;
@@ -450,6 +471,9 @@ class PaintingViewportState extends State<PaintingViewport> {
                   e.localPosition,
                   widget.spraySpread,
                   hasBackground: hasBg,
+                  sprayParticleCount: _current?.tool == DrawTool.spray
+                      ? _current!.particles.length
+                      : 0,
                 )) {
               return;
             }
@@ -478,7 +502,6 @@ class PaintingViewportState extends State<PaintingViewport> {
               _strokes.removeLast();
             }
             _current = null;
-            _repaintTick++;
             _strokeLayerTick.value++;
             widget.onHasStrokesChanged(_strokes.isNotEmpty);
           },
@@ -488,15 +511,27 @@ class PaintingViewportState extends State<PaintingViewport> {
               const ColoredBox(color: Colors.white),
               RepaintBoundary(
                 child: ListenableBuilder(
+                  listenable: _committedLayerTick,
+                  builder: (context, _) {
+                    return CustomPaint(
+                      size: size,
+                      painter: CommittedLayerPainter(
+                        _committedImage,
+                        layerTick: _committedLayerTick.value,
+                      ),
+                    );
+                  },
+                ),
+              ),
+              RepaintBoundary(
+                child: ListenableBuilder(
                   listenable: _strokeLayerTick,
                   builder: (context, _) {
                     return CustomPaint(
                       size: size,
-                      painter: DrawingPainter(
+                      painter: ActiveStrokesPainter(
                         _strokes,
-                        repaintTick: _repaintTick,
-                        drawBackground: !hasBg,
-                        committedImage: _committedImage,
+                        repaintTick: _strokeLayerTick.value,
                         committedStrokeCount: _committedStrokeCount,
                       ),
                     );
