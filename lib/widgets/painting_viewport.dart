@@ -2,8 +2,26 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
+import 'package:flutter/foundation.dart'
+    show defaultTargetPlatform, kIsWeb, TargetPlatform;
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
+
+bool _handheldTarget() =>
+    !kIsWeb &&
+    (defaultTargetPlatform == TargetPlatform.android ||
+        defaultTargetPlatform == TargetPlatform.iOS);
+
+/// Меньше пикселей при toImage — на телефонах это главный тормоз.
+double _bakeDprLimit(double dpr) {
+  if (_handheldTarget()) {
+    return math.min(
+      dpr,
+      defaultTargetPlatform == TargetPlatform.android ? 1.18 : 1.26,
+    );
+  }
+  return math.min(dpr, 2.5);
+}
 
 enum DrawTool {
   pencil,
@@ -59,16 +77,28 @@ class Stroke {
   final List<SprayParticle> particles = <SprayParticle>[];
 }
 
+void _paintSprayParticleByIndex(Canvas canvas, Stroke stroke, int j) {
+  final p = stroke.particles[j];
+  final dotPaint = Paint()
+    ..style = PaintingStyle.fill
+    ..color = stroke.color.withValues(alpha: p.alpha.clamp(0.02, 1.0))
+    ..isAntiAlias = p.radius >= 1.75;
+  canvas.drawCircle(p.offset, p.radius, dotPaint);
+}
+
+void _paintSprayTailOnCanvas(
+  Canvas canvas,
+  Stroke stroke,
+  int firstParticleIndex,
+) {
+  for (var j = firstParticleIndex; j < stroke.particles.length; j++) {
+    _paintSprayParticleByIndex(canvas, stroke, j);
+  }
+}
+
 void _paintStrokeOnCanvas(Canvas canvas, Stroke stroke) {
   if (stroke.tool == DrawTool.spray) {
-    final dotPaint = Paint()
-      ..style = PaintingStyle.fill
-      ..isAntiAlias = false;
-    for (final p in stroke.particles) {
-      dotPaint.color = stroke.color.withValues(alpha: p.alpha.clamp(0.02, 1.0));
-      dotPaint.isAntiAlias = p.radius >= 1.75;
-      canvas.drawCircle(p.offset, p.radius, dotPaint);
-    }
+    _paintSprayTailOnCanvas(canvas, stroke, 0);
     return;
   }
 
@@ -118,7 +148,7 @@ class CommittedLayerPainter extends CustomPainter {
       image!,
       src,
       Offset.zero & size,
-      Paint()..filterQuality = FilterQuality.low,
+      Paint()..filterQuality = FilterQuality.none,
     );
   }
 
@@ -133,16 +163,41 @@ class ActiveStrokesPainter extends CustomPainter {
     this.strokes, {
     required this.repaintTick,
     required this.committedStrokeCount,
+    this.liveSprayChunk,
+    this.liveSprayParticlePrefix = 0,
   });
 
   final List<Stroke> strokes;
   final int repaintTick;
   final int committedStrokeCount;
+  /// Часть текущего мазга баллончиком уже в текстуре (телефоны).
+  final ui.Image? liveSprayChunk;
+  final int liveSprayParticlePrefix;
 
   @override
   void paint(Canvas canvas, Size size) {
     for (var i = committedStrokeCount; i < strokes.length; i++) {
-      _paintStrokeOnCanvas(canvas, strokes[i]);
+      final st = strokes[i];
+      if (liveSprayChunk != null &&
+          liveSprayParticlePrefix > 0 &&
+          st.tool == DrawTool.spray &&
+          i == strokes.length - 1) {
+        final src = Rect.fromLTWH(
+          0,
+          0,
+          liveSprayChunk!.width.toDouble(),
+          liveSprayChunk!.height.toDouble(),
+        );
+        canvas.drawImageRect(
+          liveSprayChunk!,
+          src,
+          Offset.zero & size,
+          Paint()..filterQuality = FilterQuality.none,
+        );
+        _paintSprayTailOnCanvas(canvas, st, liveSprayParticlePrefix);
+        continue;
+      }
+      _paintStrokeOnCanvas(canvas, st);
     }
   }
 
@@ -150,7 +205,9 @@ class ActiveStrokesPainter extends CustomPainter {
   bool shouldRepaint(covariant ActiveStrokesPainter oldDelegate) =>
       oldDelegate.repaintTick != repaintTick ||
       oldDelegate.committedStrokeCount != committedStrokeCount ||
-      oldDelegate.strokes.length != strokes.length;
+      oldDelegate.strokes.length != strokes.length ||
+      oldDelegate.liveSprayChunk != liveSprayChunk ||
+      oldDelegate.liveSprayParticlePrefix != liveSprayParticlePrefix;
 }
 
 /// Холст: жесты и штрихи изолированы от родителя — меньше лишних перерисовок.
@@ -185,7 +242,7 @@ class PaintingViewportState extends State<PaintingViewport> {
   bool _strokeRepaintPending = false;
   int _paintGen = 0;
   /// Пропускаем почти повторяющиеся точки — меньше вершин в Path.
-  static const double _pencilMinSampleGap = 1.12;
+  double get _pencilGap => _handheldTarget() ? 1.52 : 1.12;
 
   final math.Random _rand = math.Random();
   final List<Stroke> _strokes = <Stroke>[];
@@ -205,18 +262,32 @@ class PaintingViewportState extends State<PaintingViewport> {
   /// Очередь растеризации — внутри один проход «дожимает» все штрихи до актуального конца.
   Future<void> _bakeQueue = Future<void>.value();
 
+  /// Баллончик на телефоне: часть частиц уходит в промежуточную текстуру во время жеста.
+  ui.Image? _liveSprayChunkImage;
+  int _sprayChunkCoversParticleCount = 0;
+  Future<void> _sprayChunkQueue = Future<void>.value();
+
   @override
   void dispose() {
     _committedImage?.dispose();
+    _resetSprayLiveChunk();
     _strokeLayerTick.dispose();
     _committedLayerTick.dispose();
     super.dispose();
+  }
+
+  void _resetSprayLiveChunk() {
+    _liveSprayChunkImage?.dispose();
+    _liveSprayChunkImage = null;
+    _sprayChunkCoversParticleCount = 0;
+    _sprayChunkQueue = Future<void>.value();
   }
 
   void _resetCommittedLayer() {
     _committedImage?.dispose();
     _committedImage = null;
     _committedStrokeCount = 0;
+    _resetSprayLiveChunk();
   }
 
   /// Растер в один проход: пока toImage не успел, все новые штрихи оставались векторами → тормозило.
@@ -259,13 +330,17 @@ class PaintingViewportState extends State<PaintingViewport> {
     var end = exclusiveEnd.clamp(0, _strokes.length);
     if (start >= end) return;
 
-    final bakeDpr = math.min(dpr, 2.5);
+    final bakeDpr = _bakeDprLimit(dpr);
     final w = (size.width * bakeDpr).round().clamp(1, 8192);
     final h = (size.height * bakeDpr).round().clamp(1, 8192);
 
     final recorder = ui.PictureRecorder();
     final canvas = Canvas(recorder);
     canvas.scale(bakeDpr);
+    canvas.drawRect(
+      Offset.zero & size,
+      Paint()..color = Colors.white,
+    );
 
     if (_committedImage != null) {
       final src = Rect.fromLTWH(
@@ -278,7 +353,7 @@ class PaintingViewportState extends State<PaintingViewport> {
         _committedImage!,
         src,
         Offset.zero & size,
-        Paint()..filterQuality = FilterQuality.low,
+        Paint()..filterQuality = FilterQuality.none,
       );
     }
 
@@ -318,6 +393,80 @@ class PaintingViewportState extends State<PaintingViewport> {
     _strokeLayerTick.value++;
   }
 
+  /// Сжимаем «хвост» баллончика в текстуру во время жеста (только телефоны).
+  Future<void> _extendLiveSprayChunk(int gen) async {
+    if (!mounted || gen != _paintGen) return;
+    final stroke = _current;
+    if (stroke == null || stroke.tool != DrawTool.spray) return;
+    final from = _sprayChunkCoversParticleCount;
+    final len = stroke.particles.length;
+    if (from >= len) return;
+    final take = math.min(1500, len - from);
+    if (take < 64) return;
+
+    final size = _canvasSize;
+    if (size.isEmpty) return;
+    final bakeDpr = _bakeDprLimit(_lastDpr);
+    final w = (size.width * bakeDpr).round().clamp(1, 8192);
+    final h = (size.height * bakeDpr).round().clamp(1, 8192);
+
+    final recorder = ui.PictureRecorder();
+    final canvas = Canvas(recorder);
+    canvas.scale(bakeDpr);
+
+    if (_liveSprayChunkImage != null) {
+      final src = Rect.fromLTWH(
+        0,
+        0,
+        _liveSprayChunkImage!.width.toDouble(),
+        _liveSprayChunkImage!.height.toDouble(),
+      );
+      canvas.drawImageRect(
+        _liveSprayChunkImage!,
+        src,
+        Offset.zero & size,
+        Paint()..filterQuality = FilterQuality.none,
+      );
+    }
+
+    for (var j = from; j < from + take; j++) {
+      _paintSprayParticleByIndex(canvas, stroke, j);
+    }
+
+    final picture = recorder.endRecording();
+    ui.Image newChunk;
+    try {
+      newChunk = await picture.toImage(w, h);
+    } catch (_) {
+      picture.dispose();
+      return;
+    }
+    picture.dispose();
+
+    if (!mounted) {
+      newChunk.dispose();
+      return;
+    }
+    if (gen != _paintGen) {
+      newChunk.dispose();
+      return;
+    }
+    if (_current != stroke) {
+      newChunk.dispose();
+      return;
+    }
+    if (_sprayChunkCoversParticleCount != from) {
+      newChunk.dispose();
+      return;
+    }
+
+    final prev = _liveSprayChunkImage;
+    _liveSprayChunkImage = newChunk;
+    _sprayChunkCoversParticleCount = from + take;
+    prev?.dispose();
+    _strokeLayerTick.value++;
+  }
+
   void clearStrokes() {
     _paintGen++;
     _strokeRepaintPending = false;
@@ -335,9 +484,9 @@ class PaintingViewportState extends State<PaintingViewport> {
     final stroke = _current;
     if (stroke == null || stroke.tool != DrawTool.pencil) return;
     final pts = stroke.linePoints;
-    const maxPencilPoints = 8000;
-    if (pts.isNotEmpty && pts.length >= maxPencilPoints) return;
-    if (pts.isEmpty || (p - pts.last).distance >= _pencilMinSampleGap) {
+    final maxPts = _handheldTarget() ? 5600 : 8000;
+    if (pts.isNotEmpty && pts.length >= maxPts) return;
+    if (pts.isEmpty || (p - pts.last).distance >= _pencilGap) {
       pts.add(p);
     }
   }
@@ -365,10 +514,15 @@ class PaintingViewportState extends State<PaintingViewport> {
     const maxParticlesPerStroke = 11000;
     if (s.particles.length >= maxParticlesPerStroke) return;
     final spread = widget.spraySpread;
+    final handheld = _handheldTarget();
     // С фоном композитит две полноэкранные текстуры — уменьшаем «порцию» частиц за событие.
     final bgMul = hasBackground ? 0.76 : 1.0;
     var count = (7 + widget.spraySpread * 0.95) * areaFactor * bgMul;
-    final cap = hasBackground ? 28 : 38;
+    var cap = hasBackground ? 28 : 38;
+    if (handheld) {
+      count *= 0.72;
+      cap = math.max(4, (cap * 0.78).floor());
+    }
     count = count.round().clamp(4, cap).toDouble();
     final n = count.round();
     for (var i = 0; i < n; i++) {
@@ -381,6 +535,13 @@ class PaintingViewportState extends State<PaintingViewport> {
       s.particles.add(
         SprayParticle(Offset(center.dx + dx, center.dy + dy), dotR, alpha),
       );
+    }
+    if (_handheldTarget()) {
+      final tail = s.particles.length - _sprayChunkCoversParticleCount;
+      if (tail > 2200) {
+        final g = _paintGen;
+        _sprayChunkQueue = _sprayChunkQueue.then((_) => _extendLiveSprayChunk(g));
+      }
     }
   }
 
@@ -409,6 +570,10 @@ class PaintingViewportState extends State<PaintingViewport> {
     if (sprayParticleCount > 8000) {
       minGap *= 1.4;
       minMs = math.max(minMs, 33);
+    }
+    if (_handheldTarget()) {
+      minGap *= 1.1;
+      minMs = math.max(minMs, 20);
     }
     if (dtMs < minMs && dist < minGap) return false;
     return true;
@@ -446,12 +611,14 @@ class PaintingViewportState extends State<PaintingViewport> {
             _lastSprayTime = null;
             _lastSprayPos = null;
             if (widget.tool == DrawTool.pencil) {
+              _resetSprayLiveChunk();
               _current = Stroke(
                 widget.color,
                 DrawTool.pencil,
                 lineWidth: widget.pencilWidth,
               )..linePoints.add(e.localPosition);
             } else {
+              _resetSprayLiveChunk();
               _current = Stroke(widget.color, DrawTool.spray, lineWidth: 0);
               _sprayAt(e.localPosition, areaFactor, hasBackground: hasBg);
               _lastSprayTime = DateTime.now();
@@ -472,7 +639,10 @@ class PaintingViewportState extends State<PaintingViewport> {
                   widget.spraySpread,
                   hasBackground: hasBg,
                   sprayParticleCount: _current?.tool == DrawTool.spray
-                      ? _current!.particles.length
+                      ? (_current!.particles.length -
+                          (_handheldTarget()
+                              ? _sprayChunkCoversParticleCount
+                              : 0))
                       : 0,
                 )) {
               return;
@@ -502,6 +672,7 @@ class PaintingViewportState extends State<PaintingViewport> {
               _strokes.removeLast();
             }
             _current = null;
+            _resetSprayLiveChunk();
             _strokeLayerTick.value++;
             widget.onHasStrokesChanged(_strokes.isNotEmpty);
           },
@@ -533,6 +704,10 @@ class PaintingViewportState extends State<PaintingViewport> {
                         _strokes,
                         repaintTick: _strokeLayerTick.value,
                         committedStrokeCount: _committedStrokeCount,
+                        liveSprayChunk:
+                            _handheldTarget() ? _liveSprayChunkImage : null,
+                        liveSprayParticlePrefix:
+                            _handheldTarget() ? _sprayChunkCoversParticleCount : 0,
                       ),
                     );
                   },
@@ -545,12 +720,14 @@ class PaintingViewportState extends State<PaintingViewport> {
                       builder: (context, innerConstraints) {
                         final dpr =
                             MediaQuery.devicePixelRatioOf(context);
+                        final decodeMax =
+                            _handheldTarget() ? 960 : 1536;
                         final cw = (innerConstraints.maxWidth * dpr)
                             .round()
-                            .clamp(256, 1536);
+                            .clamp(256, decodeMax);
                         final ch = (innerConstraints.maxHeight * dpr)
                             .round()
-                            .clamp(256, 1536);
+                            .clamp(256, decodeMax);
                         return SizedBox(
                           width: innerConstraints.maxWidth,
                           height: innerConstraints.maxHeight,
