@@ -7,6 +7,13 @@ import 'package:flutter/material.dart';
 import '../utils/outline_coloring_image.dart';
 import '../widgets/painting_viewport.dart';
 
+/// Выбор при замене фото: отмена, очистить рисунок или оставить.
+enum ReplacePhotoChoice {
+  cancel,
+  clearStrokes,
+  keepStrokes,
+}
+
 /// Свободная раскраска поверх контура с фото.
 class ColoringScreen extends StatefulWidget {
   const ColoringScreen({super.key});
@@ -61,7 +68,54 @@ class _ColoringScreenState extends State<ColoringScreen> {
     });
   }
 
+  /// Если уже есть фон или рисунок — спросить, чистить ли холст перед новой загрузкой.
+  Future<ReplacePhotoChoice> _confirmReplacePhotoIfNeeded() async {
+    final hasPhoto = _backgroundBytes != null;
+    final hasDrawing = _hasStrokesNotifier.value;
+    if (!hasPhoto && !hasDrawing) {
+      return ReplacePhotoChoice.keepStrokes;
+    }
+    final choice = await showDialog<ReplacePhotoChoice>(
+      context: context,
+      builder: (ctx) {
+        return AlertDialog(
+          title: const Text('Новая картинка'),
+          content: Text(
+            hasPhoto && hasDrawing
+                ? 'Уже загружен контур и есть раскраска. Очистить рисунок перед загрузкой новой фотографии? Если оставить — новый контур может не совпасть с прежними линиями.'
+                : hasPhoto
+                    ? 'Уже загружен контур с текущей фотографией. Очистить раскраску перед загрузкой новой?'
+                    : 'На холсте есть раскраска без фона. Очистить её перед загрузкой фотографии?',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () =>
+                  Navigator.pop(ctx, ReplacePhotoChoice.cancel),
+              child: const Text('Отмена'),
+            ),
+            TextButton(
+              onPressed: () =>
+                  Navigator.pop(ctx, ReplacePhotoChoice.keepStrokes),
+              child: const Text('Не очищать'),
+            ),
+            FilledButton(
+              onPressed: () =>
+                  Navigator.pop(ctx, ReplacePhotoChoice.clearStrokes),
+              child: const Text('Очистить и загрузить'),
+            ),
+          ],
+        );
+      },
+    );
+    return choice ?? ReplacePhotoChoice.cancel;
+  }
+
   Future<void> _pickImage() async {
+    final replaceChoice = await _confirmReplacePhotoIfNeeded();
+    if (!mounted || replaceChoice == ReplacePhotoChoice.cancel) {
+      return;
+    }
+
     final result = await FilePicker.platform.pickFiles(
       type: FileType.image,
       allowMultiple: false,
@@ -104,6 +158,10 @@ class _ColoringScreenState extends State<ColoringScreen> {
       );
       return;
     }
+    if (replaceChoice == ReplacePhotoChoice.clearStrokes) {
+      _clearStrokes();
+    }
+    if (!mounted) return;
     setState(() {
       _backgroundBytes = outline;
       _outlineFit = OutlineImageFit.contain;
