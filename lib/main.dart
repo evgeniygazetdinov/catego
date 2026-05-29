@@ -1,8 +1,11 @@
 import 'package:flutter/material.dart';
+import 'package:yandex_mobileads/mobile_ads.dart';
 
 import 'screens/coloring_screen.dart';
 
-void main() {
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await YandexAds.initialize();
   runApp(const MyApp());
 }
 

@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 
 import '../utils/outline_coloring_image.dart';
 import '../widgets/painting_viewport.dart';
+import '../widgets/yandex_sticky_banner.dart';
 
 /// Выбор при замене фото: отмена, очистить рисунок или оставить.
 enum ReplacePhotoChoice {
@@ -443,6 +444,7 @@ class _ColoringScreenState extends State<ColoringScreen> {
               ),
             ),
           ),
+          const YandexStickyBanner(),
         ],
       ),
     );
